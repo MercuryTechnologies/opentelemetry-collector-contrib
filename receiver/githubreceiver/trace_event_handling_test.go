@@ -436,8 +436,11 @@ func TestCreateStepSpans(t *testing.T) {
 			parentSpanID, err := newParentSpanID(tt.event.GetWorkflowJob().GetID(), int(tt.event.GetWorkflowJob().GetRunAttempt()))
 			require.NoError(t, err)
 
+			// Create generator for testing (use legacy for backward compatibility)
+			generator := newIDGenerator(IDGenerationLegacy)
+
 			// Call createStepSpans
-			err = receiver.createStepSpans(resourceSpans, tt.event, traceID, parentSpanID)
+			err = receiver.createStepSpans(resourceSpans, tt.event, traceID, parentSpanID, generator)
 
 			if tt.wantErr {
 				require.Error(t, err)

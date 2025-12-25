@@ -100,6 +100,7 @@ func TestLoadConfig(t *testing.T) {
 				},
 			},
 		},
+		IDGeneration: IDGenerationLegacy,
 	}
 
 	assert.Equal(t, expectedConfig, r1)
@@ -190,6 +191,105 @@ func TestIncludeSpanEventsConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			require.Equal(t, tt.expected, tt.config.WebHook.IncludeSpanEvents)
+		})
+	}
+}
+
+func TestIDGenerationConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    *Config
+		expected  IDGeneration
+		expectErr bool
+	}{
+		{
+			name: "default config has legacy ID generation",
+			config: func() *Config {
+				cfg := createDefaultConfig().(*Config)
+				cfg.Scrapers = map[string]internal.Config{
+					githubscraper.TypeStr: (&githubscraper.Factory{}).CreateDefaultConfig(),
+				}
+				cfg.WebHook.ServerConfig.Endpoint = "localhost:8080"
+				return cfg
+			}(),
+			expected:  IDGenerationLegacy,
+			expectErr: false,
+		},
+		{
+			name: "legacy ID generation is valid",
+			config: &Config{
+				Scrapers: map[string]internal.Config{
+					githubscraper.TypeStr: (&githubscraper.Factory{}).CreateDefaultConfig(),
+				},
+				WebHook: WebHook{
+					ServerConfig: confighttp.ServerConfig{
+						Endpoint: "localhost:8080",
+					},
+				},
+				IDGeneration: IDGenerationLegacy,
+			},
+			expected:  IDGenerationLegacy,
+			expectErr: false,
+		},
+		{
+			name: "github_context ID generation is valid",
+			config: &Config{
+				Scrapers: map[string]internal.Config{
+					githubscraper.TypeStr: (&githubscraper.Factory{}).CreateDefaultConfig(),
+				},
+				WebHook: WebHook{
+					ServerConfig: confighttp.ServerConfig{
+						Endpoint: "localhost:8080",
+					},
+				},
+				IDGeneration: IDGenerationGitHubContext,
+			},
+			expected:  IDGenerationGitHubContext,
+			expectErr: false,
+		},
+		{
+			name: "invalid ID generation value causes error",
+			config: &Config{
+				Scrapers: map[string]internal.Config{
+					githubscraper.TypeStr: (&githubscraper.Factory{}).CreateDefaultConfig(),
+				},
+				WebHook: WebHook{
+					ServerConfig: confighttp.ServerConfig{
+						Endpoint: "localhost:8080",
+					},
+				},
+				IDGeneration: "invalid_value",
+			},
+			expectErr: true,
+		},
+		{
+			name: "empty ID generation defaults to legacy",
+			config: &Config{
+				Scrapers: map[string]internal.Config{
+					githubscraper.TypeStr: (&githubscraper.Factory{}).CreateDefaultConfig(),
+				},
+				WebHook: WebHook{
+					ServerConfig: confighttp.ServerConfig{
+						Endpoint: "localhost:8080",
+					},
+				},
+				IDGeneration: "",
+			},
+			expected:  IDGenerationLegacy,
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.expectErr {
+				require.Error(t, err)
+				require.ErrorIs(t, err, errInvalidIDGeneration)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.expected, tt.config.IDGeneration)
+			}
 		})
 	}
 }
