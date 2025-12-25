@@ -30,12 +30,30 @@ const (
 	defaultUserAgentHeader          = "User-Agent"          // Value always prefixed with "GitHub-Hookshot/"
 )
 
+// IDGeneration specifies the algorithm for deterministic trace/span ID generation.
+type IDGeneration string
+
+const (
+	// IDGenerationLegacy uses the current ID generation algorithm based on run_id + run_attempt.
+	IDGenerationLegacy IDGeneration = "legacy"
+	// IDGenerationGitHubContext uses a GitHub context-inspired algorithm that leverages
+	// workflow_job.id (check run ID) for more stable IDs that align with GitHub's job context.
+	// Note: This mode approximates github.action naming using webhook-available data and does
+	// not attempt to match exact runner behavior like __run/__run_2 naming.
+	IDGenerationGitHubContext IDGeneration = "github_context"
+)
+
+const (
+	defaultIDGeneration = IDGenerationLegacy
+)
+
 // Config that is exposed to this github receiver through the OTEL config.yaml
 type Config struct {
 	scraperhelper.ControllerConfig `mapstructure:",squash"`
 	Scrapers                       map[string]internal.Config `mapstructure:"scrapers"`
 	metadata.MetricsBuilderConfig  `mapstructure:",squash"`
-	WebHook                        WebHook `mapstructure:"webhook"`
+	WebHook                        WebHook        `mapstructure:"webhook"`
+	IDGeneration                   IDGeneration   `mapstructure:"id_generation"`
 }
 
 type WebHook struct {
@@ -64,6 +82,7 @@ var (
 	errRequiredHeader              = errors.New("both key and value are required to assign a required_header")
 	errRequireOneScraper           = errors.New("must specify at least one scraper")
 	errGitHubHeader                = errors.New("github default headers [X-GitHub-Event, X-GitHub-Delivery, X-GitHub-Hook-ID, X-Hub-Signature-256] cannot be configured")
+	errInvalidIDGeneration         = errors.New("invalid id_generation value; must be 'legacy' or 'github_context'")
 )
 
 // Validate the configuration passed through the OTEL config.yaml
@@ -74,6 +93,19 @@ func (cfg *Config) Validate() error {
 	// and other signals are added, this requirement will change.
 	if len(cfg.Scrapers) == 0 {
 		errs = multierr.Append(errs, errRequireOneScraper)
+	}
+
+	// Default to legacy if unset (defensive, in case older configs omit it)
+	if cfg.IDGeneration == "" {
+		cfg.IDGeneration = defaultIDGeneration
+	}
+
+	// Validate id_generation value
+	switch cfg.IDGeneration {
+	case IDGenerationLegacy, IDGenerationGitHubContext:
+		// Valid values
+	default:
+		errs = multierr.Append(errs, errInvalidIDGeneration)
 	}
 
 	maxReadWriteTimeout, _ := time.ParseDuration("10s")

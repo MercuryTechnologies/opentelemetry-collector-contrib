@@ -84,6 +84,7 @@ func createDefaultConfig() component.Config {
 			HealthPath:        defaultHealthPath,
 			IncludeSpanEvents: defaultIncludeSpanEvents,
 		},
+		IDGeneration: defaultIDGeneration,
 	}
 }
 
