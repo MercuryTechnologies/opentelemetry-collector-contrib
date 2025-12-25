@@ -4,8 +4,6 @@
 package githubreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/githubreceiver"
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,7 +28,8 @@ func (gtr *githubTracesReceiver) handleWorkflowRun(e *github.WorkflowRunEvent, r
 		return ptrace.Traces{}, fmt.Errorf("failed to get workflow run attributes: %w", err)
 	}
 
-	traceID, err := newTraceID(e.GetWorkflowRun().GetID(), e.GetWorkflowRun().GetRunAttempt())
+	generator := newIDGenerator(gtr.cfg.IDGeneration)
+	traceID, err := generator.generateTraceID(e.GetWorkflowRun().GetID(), e.GetWorkflowRun().GetRunAttempt())
 	if err != nil {
 		gtr.logger.Sugar().Error("failed to generate trace ID", zap.Error(err))
 	}
@@ -57,24 +56,34 @@ func (gtr *githubTracesReceiver) handleWorkflowJob(e *github.WorkflowJobEvent, r
 		return ptrace.Traces{}, fmt.Errorf("failed to get workflow run attributes: %w", err)
 	}
 
-	traceID, err := newTraceID(e.GetWorkflowJob().GetRunID(), int(e.GetWorkflowJob().GetRunAttempt()))
+	generator := newIDGenerator(gtr.cfg.IDGeneration)
+
+	// For github_context mode, use job.id (check run ID) instead of run.id
+	var traceBaseID int64
+	if gtr.cfg.IDGeneration == IDGenerationGitHubContext {
+		traceBaseID = e.GetWorkflowJob().GetID()
+	} else {
+		traceBaseID = e.GetWorkflowJob().GetRunID()
+	}
+
+	traceID, err := generator.generateTraceID(traceBaseID, int(e.GetWorkflowJob().GetRunAttempt()))
 	if err != nil {
 		gtr.logger.Sugar().Error("failed to generate trace ID", zap.Error(err))
 	}
 
-	parentID, err := gtr.createParentSpan(r, e, traceID, rawPayload)
+	parentID, err := gtr.createParentSpan(r, e, traceID, rawPayload, generator)
 	if err != nil {
 		gtr.logger.Sugar().Error("failed to create parent span", zap.Error(err))
 		return ptrace.Traces{}, errors.New("failed to create parent span")
 	}
 
-	queueSpanID, err := gtr.createJobQueueSpan(r, e, traceID, parentID)
+	queueSpanID, err := gtr.createJobQueueSpan(r, e, traceID, parentID, generator)
 	if err != nil {
 		gtr.logger.Sugar().Error("failed to create job queue span", zap.Error(err))
 		return ptrace.Traces{}, errors.New("failed to create job queue span")
 	}
 
-	err = gtr.createStepSpans(r, e, traceID, queueSpanID)
+	err = gtr.createStepSpans(r, e, traceID, queueSpanID, generator)
 	if err != nil {
 		gtr.logger.Sugar().Error("failed to create step spans", zap.Error(err))
 		return ptrace.Traces{}, errors.New("failed to create step spans")
@@ -86,39 +95,21 @@ func (gtr *githubTracesReceiver) handleWorkflowJob(e *github.WorkflowJobEvent, r
 // newTraceID creates a deterministic Trace ID based on the provided inputs of
 // runID and runAttempt. `t` is appended to the end of the input to
 // differentiate between a deterministic traceID and the parentSpanID.
+//
+// Deprecated: Use idGenerator.generateTraceID instead. Kept for backward compatibility.
 func newTraceID(runID int64, runAttempt int) (pcommon.TraceID, error) {
-	input := fmt.Sprintf("%d%dt", runID, runAttempt)
-	// TODO: Determine if this is the best hashing algorithm to use. This is
-	// more likely to generate a unique hash compared to MD5 or SHA1. Could
-	// alternatively use UUID library to generate a unique ID by also using a
-	// hash.
-	hash := sha256.Sum256([]byte(input))
-	idHex := hex.EncodeToString(hash[:])
-
-	var id pcommon.TraceID
-	_, err := hex.Decode(id[:], []byte(idHex[:32]))
-	if err != nil {
-		return pcommon.TraceID{}, err
-	}
-
-	return id, nil
+	generator := &legacyIDGenerator{}
+	return generator.generateTraceID(runID, runAttempt)
 }
 
 // newParentId creates a deterministic Parent Span ID based on the provided
 // runID and runAttempt. `s` is appended to the end of the input to
 // differentiate between a deterministic traceID and the parentSpanID.
+//
+// Deprecated: Use idGenerator.generateParentSpanID instead. Kept for backward compatibility.
 func newParentSpanID(runID int64, runAttempt int) (pcommon.SpanID, error) {
-	input := fmt.Sprintf("%d%ds", runID, runAttempt)
-	hash := sha256.Sum256([]byte(input))
-	spanIDHex := hex.EncodeToString(hash[:])
-
-	var spanID pcommon.SpanID
-	_, err := hex.Decode(spanID[:], []byte(spanIDHex[16:32]))
-	if err != nil {
-		return pcommon.SpanID{}, err
-	}
-
-	return spanID, nil
+	generator := &legacyIDGenerator{}
+	return generator.generateParentSpanID(runID, runAttempt)
 }
 
 // correctActionTimestamps ensures span timestamps are valid by checking that
@@ -148,7 +139,8 @@ func (gtr *githubTracesReceiver) createRootSpan(
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
 	span := scopeSpans.Spans().AppendEmpty()
 
-	rootSpanID, err := newParentSpanID(event.GetWorkflowRun().GetID(), event.GetWorkflowRun().GetRunAttempt())
+	generator := newIDGenerator(gtr.cfg.IDGeneration)
+	rootSpanID, err := generator.generateParentSpanID(event.GetWorkflowRun().GetID(), event.GetWorkflowRun().GetRunAttempt())
 	if err != nil {
 		return fmt.Errorf("failed to generate root span ID: %w", err)
 	}
@@ -184,7 +176,7 @@ func (gtr *githubTracesReceiver) createRootSpan(
 	if event.GetWorkflowRun().GetPreviousAttemptURL() != "" && event.GetWorkflowRun().GetRunAttempt() > 1 {
 		gtr.logger.Debug("Linking to previous trace ID for WorkflowRunEvent")
 		previousRunAttempt := event.GetWorkflowRun().GetRunAttempt() - 1
-		previousTraceID, err := newTraceID(event.GetWorkflowRun().GetID(), previousRunAttempt)
+		previousTraceID, err := generator.generateTraceID(event.GetWorkflowRun().GetID(), previousRunAttempt)
 		if err != nil {
 			return fmt.Errorf("failed to generate previous traceID: %w", err)
 		}
@@ -204,16 +196,25 @@ func (gtr *githubTracesReceiver) createParentSpan(
 	event *github.WorkflowJobEvent,
 	traceID pcommon.TraceID,
 	rawPayload []byte,
+	generator idGenerator,
 ) (pcommon.SpanID, error) {
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
 	span := scopeSpans.Spans().AppendEmpty()
 
-	parentSpanID, err := newParentSpanID(event.GetWorkflowJob().GetRunID(), int(event.GetWorkflowJob().GetRunAttempt()))
+	// Determine the base ID for parent/job span generation
+	var baseID int64
+	if gtr.cfg.IDGeneration == IDGenerationGitHubContext {
+		baseID = event.GetWorkflowJob().GetID()
+	} else {
+		baseID = event.GetWorkflowJob().GetRunID()
+	}
+
+	parentSpanID, err := generator.generateParentSpanID(baseID, int(event.GetWorkflowJob().GetRunAttempt()))
 	if err != nil {
 		return pcommon.SpanID{}, fmt.Errorf("failed to generate parent span ID: %w", err)
 	}
 
-	jobSpanID, err := newJobSpanID(event.GetWorkflowJob().GetRunID(), int(event.GetWorkflowJob().GetRunAttempt()), event.GetWorkflowJob().GetName())
+	jobSpanID, err := generator.generateJobSpanID(baseID, int(event.GetWorkflowJob().GetRunAttempt()), event.GetWorkflowJob().GetName())
 	if err != nil {
 		return pcommon.SpanID{}, fmt.Errorf("failed to generate job span ID: %w", err)
 	}
@@ -252,18 +253,11 @@ func (gtr *githubTracesReceiver) createParentSpan(
 
 // newJobSpanId creates a deterministic Job Span ID based on the provided runID,
 // runAttempt, and the name of the job.
+//
+// Deprecated: Use idGenerator.generateJobSpanID instead. Kept for backward compatibility.
 func newJobSpanID(runID int64, runAttempt int, jobName string) (pcommon.SpanID, error) {
-	input := fmt.Sprintf("%d%d%s", runID, runAttempt, jobName)
-	hash := sha256.Sum256([]byte(input))
-	spanIDHex := hex.EncodeToString(hash[:])
-
-	var spanID pcommon.SpanID
-	_, err := hex.Decode(spanID[:], []byte(spanIDHex[16:32]))
-	if err != nil {
-		return pcommon.SpanID{}, err
-	}
-
-	return spanID, nil
+	generator := &legacyIDGenerator{}
+	return generator.generateJobSpanID(runID, runAttempt, jobName)
 }
 
 // createStepSpans is a wrapper function to create spans for each step in the
@@ -274,13 +268,14 @@ func (gtr *githubTracesReceiver) createStepSpans(
 	event *github.WorkflowJobEvent,
 	traceID pcommon.TraceID,
 	parentSpanID pcommon.SpanID,
+	generator idGenerator,
 ) error {
 	steps := event.GetWorkflowJob().Steps
 	unique := newUniqueSteps(steps)
 	var errors error
 	for i, step := range steps {
 		name := unique[i]
-		err := gtr.createStepSpan(resourceSpans, traceID, parentSpanID, event, step, name)
+		err := gtr.createStepSpan(resourceSpans, traceID, parentSpanID, event, step, name, generator)
 		if err != nil {
 			errors = multierr.Append(errors, err)
 		}
@@ -324,13 +319,14 @@ func newUniqueSteps(steps []*github.TaskStep) []string {
 
 // createStepSpan creates a span with a deterministic spandID for the provided
 // step.
-func (*githubTracesReceiver) createStepSpan(
+func (gtr *githubTracesReceiver) createStepSpan(
 	resourceSpans ptrace.ResourceSpans,
 	traceID pcommon.TraceID,
 	parentSpanID pcommon.SpanID,
 	event *github.WorkflowJobEvent,
 	step *github.TaskStep,
 	name string,
+	generator idGenerator,
 ) error {
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
 	span := scopeSpans.Spans().AppendEmpty()
@@ -339,12 +335,20 @@ func (*githubTracesReceiver) createStepSpan(
 	span.SetTraceID(traceID)
 	span.SetParentSpanID(parentSpanID)
 
-	runID := event.GetWorkflowJob().GetRunID()
+	// Determine the base ID for step span generation
+	var baseID int64
+	if gtr.cfg.IDGeneration == IDGenerationGitHubContext {
+		baseID = event.GetWorkflowJob().GetID()
+	} else {
+		baseID = event.GetWorkflowJob().GetRunID()
+	}
+
 	runAttempt := int(event.GetWorkflowJob().GetRunAttempt())
 	jobName := event.GetWorkflowJob().GetName()
-	stepName := step.GetName()
 	number := int(step.GetNumber())
-	spanID, err := newStepSpanID(runID, runAttempt, jobName, stepName, number)
+
+	// Use the unique name (which may have -1, -2 suffix) as the step identifier
+	spanID, err := generator.generateStepSpanID(baseID, runAttempt, jobName, name, number)
 	if err != nil {
 		return fmt.Errorf("failed to generate step span ID: %w", err)
 	}
@@ -382,27 +386,21 @@ func (*githubTracesReceiver) createStepSpan(
 
 // newStepSpanID creates a deterministic Step Span ID based on the provided
 // inputs.
+//
+// Deprecated: Use idGenerator.generateStepSpanID instead. Kept for backward compatibility.
 func newStepSpanID(runID int64, runAttempt int, jobName, stepName string, number int) (pcommon.SpanID, error) {
-	input := fmt.Sprintf("%d%d%s%s%d", runID, runAttempt, jobName, stepName, number)
-	hash := sha256.Sum256([]byte(input))
-	spanIDHex := hex.EncodeToString(hash[:])
-
-	var spanID pcommon.SpanID
-	_, err := hex.Decode(spanID[:], []byte(spanIDHex[16:32]))
-	if err != nil {
-		return pcommon.SpanID{}, err
-	}
-
-	return spanID, nil
+	generator := &legacyIDGenerator{}
+	return generator.generateStepSpanID(runID, runAttempt, jobName, stepName, number)
 }
 
 // createJobQueueSpan creates a span for the job queue based on the provided
 // event by using the delta between the job created and completed times.
-func (*githubTracesReceiver) createJobQueueSpan(
+func (gtr *githubTracesReceiver) createJobQueueSpan(
 	resourceSpans ptrace.ResourceSpans,
 	event *github.WorkflowJobEvent,
 	traceID pcommon.TraceID,
 	parentSpanID pcommon.SpanID,
+	generator idGenerator,
 ) (pcommon.SpanID, error) {
 	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
 	span := scopeSpans.Spans().AppendEmpty()
@@ -414,9 +412,16 @@ func (*githubTracesReceiver) createJobQueueSpan(
 	span.SetTraceID(traceID)
 	span.SetParentSpanID(parentSpanID)
 
-	runID := event.GetWorkflowJob().GetRunID()
+	// Determine the base ID for queue span generation
+	var baseID int64
+	if gtr.cfg.IDGeneration == IDGenerationGitHubContext {
+		baseID = event.GetWorkflowJob().GetID()
+	} else {
+		baseID = event.GetWorkflowJob().GetRunID()
+	}
+
 	runAttempt := int(event.GetWorkflowJob().GetRunAttempt())
-	spanID, err := newStepSpanID(runID, runAttempt, jobName, spanName, 1)
+	spanID, err := generator.generateStepSpanID(baseID, runAttempt, jobName, spanName, 1)
 	if err != nil {
 		return pcommon.SpanID{}, fmt.Errorf("failed to generate step span ID: %w", err)
 	}
